@@ -1,8 +1,10 @@
 import logging
 from enum import IntEnum
-from typing import Optional, Union
+from typing import Optional, Union, Mapping
 
 from usb.core import find, Device
+
+from pyusbmuxd.exceptions import PyUsbMuxException
 
 INTERFACE_CLASS = 255
 INTERFACE_SUBCLASS = 254
@@ -32,6 +34,9 @@ PID_APPLE_SILICON_RESTORE_MAX = 0x1905
 ENV_DEVICE_MODE = 'USBMUXD_DEFAULT_DEVICE_MODE'
 APPLE_VEND_SPECIFIC_GET_MODE = 0x45
 APPLE_VEND_SPECIFIC_SET_MODE = 0x52
+
+LIBUSB_ENDPOINT_IN = 0x80
+LIBUSB_ENDPOINT_OUT = 0x00
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +84,7 @@ class Mode(IntEnum):
 class IDevice:
     def __init__(self, usb_device: Device):
         self.usb_device = usb_device
+        self._set_valid_configuration()
 
     @property
     def mode(self) -> Optional[Mode]:
@@ -126,6 +132,9 @@ class IDevice:
     def serial(self) -> str:
         return self.usb_device.serial_number
 
+    def send(self, data: bytes) -> None:
+        self.usb_device.write(self.usb_device.backend)
+
     def __repr__(self) -> str:
         if self.mode is not None:
             mode = self.mode.name
@@ -133,6 +142,70 @@ class IDevice:
             mode = 'Unknown'
 
         return f'<{self.__class__.__name__} SERIAL:{self.serial} MODE:{mode}>'
+
+    def _set_valid_configuration(self) -> None:
+        """ Finds and sets the valid configuration, interface and endpoints on the usb_device """
+        # TODO: uncomment to debug
+        return
+
+        found = False
+        current_config = self.usb_device.get_active_configuration()
+        for config in self.usb_device.configurations():
+            for interface in config.interfaces():
+                if (interface.bInterfaceClass == INTERFACE_CLASS or
+                        interface.bInterfaceSubClass == INTERFACE_SUBCLASS and
+                        interface.bInterfaceProtocol == INTERFACE_PROTOCOL):
+                    logger.info(f'Found usbmux interface for device {self.usb_device.bus}-{self.usb_device.address}: '
+                                f'{interface.bInterfaceNumber}')
+                    if interface.bNumEndpoints != 2:
+                        logger.warning(
+                            f'Endpoint count mismatch for interface {interface.bInterfaceNumber} of device '
+                            f'{self.usb_device.bus}-{self.usb_device.address}')
+                        continue
+                    endpoints = interface.endpoints()
+                    if ((endpoints[0].bEndpointAddress & 0x80) == LIBUSB_ENDPOINT_OUT) and \
+                            ((endpoints[1].bEndpointAddress & 0x80) == LIBUSB_ENDPOINT_IN):
+                        self.interface = interface
+                        self.ep_out = endpoints[0].bEndpointAddress
+                        self.ep_in = endpoints[1].bEndpointAddress
+                        logger.info(f'Found interface {interface.bInterfaceNumber} with endpoints '
+                                    f'{self.ep_out:02x}/{self.ep_in:02x} for device '
+                                    f'{self.usb_device.bus}-{self.usb_device.address}')
+                        found = True
+                    elif ((endpoints[1].bEndpointAddress & 0x80) == LIBUSB_ENDPOINT_OUT) and \
+                            ((endpoints[0].bEndpointAddress & 0x80) == LIBUSB_ENDPOINT_IN):
+                        self.interface = interface
+                        self.ep_out = endpoints[0].bEndpointAddress
+                        self.ep_in = endpoints[1].bEndpointAddress
+                        logger.info(f'Found interface {interface.bInterfaceNumber} with swapped endpoints '
+                                    f'{self.ep_out:02x}/{self.ep_in:02x} for device '
+                                    f'{self.usb_device.bus}-{self.usb_device.address}')
+                        found = True
+                    else:
+                        logger.warning(f'Endpoint type mismatch for interface {interface.bInterfaceNumber} of device '
+                                       f'{self.usb_device.bus}-{self.usb_device.address}')
+            if not found:
+                continue
+
+            # If set configuration is required, try to first detach all kernel drivers
+            if current_config is None:
+                logger.debug(f'Device {self.usb_device.bus}-{self.usb_device.address} is unconfigured')
+
+            if (current_config is None) or (config.bConfigurationValue != current_config.bConfigurationValue):
+                logger.info(f'Changing configuration of device {self.usb_device.bus}-{self.usb_device.address}')
+
+                for interface in config.interfaces():
+                    if self.usb_device.is_kernel_driver_active(interface.bInterfaceNumber):
+                        logger.info(
+                            f'Detaching kernel driver for device {self.usb_device.bus}-{self.usb_device.address}'
+                            f', interface {interface.bInterfaceNumber}')
+                        self.usb_device.detach_kernel_driver(interface)
+
+            self.usb_device.set_configuration(config)
+
+        if not found:
+            raise PyUsbMuxException(f'Could not find a suitable USB interface for device '
+                                    f'{self.usb_device.bus}-{self.usb_device.address}')
 
     def _submit_vendor_specific(self, b_request: int, w_value: int = 0, w_index: int = 0,
                                 data_or_w_length: Union[bytes, int] = 0, timeout: Optional[int] = None
@@ -144,7 +217,7 @@ class IDevice:
 
 class UsbManager:
     def __init__(self):
-        self.devices = dict()
+        self.devices: Mapping[str, IDevice] = dict()
 
     def update_device_list(self) -> None:
         devices = find(find_all=True)
