@@ -1,3 +1,4 @@
 pyusb
 click
 coloredlogs
+inquirer3>=0.1.0
